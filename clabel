@@ -1,0 +1,552 @@
+#!/usr/bin/perl -w
+
+# C-Label designer for Brother 1230PC label printer
+# Crawford Currie (C) 2015 http://c-dot.co.uk
+# Based on B-Label (C) 2012 A. Sovijärvi (ari@sovijarvi.fi)
+# Distributed under the Perl Artistic License.
+
+use strict;
+use warnings;
+
+use Gtk2 -init;
+use Gtk2::GladeXML ();
+use Cairo ();
+use GD ();
+use Getopt::Long ();
+use Data::Dumper ();
+use File::Basename ();
+use Net::CUPS ();
+use File::Temp ();
+
+use constant NO_PRINT => 0;
+use constant GLADE_FILE => File::Basename::dirname(__FILE__).'/clabel.glade';
+use constant SETTINGS => "$ENV{HOME}/.config/clabel";
+our $device;
+
+our $BASE = [ 'printer', 'font', 'tape' ];
+our $PER_LABEL = [
+    'text', 'bold', 'italic', 'underline', 'tt',
+    'sub', 'sup', 'xalign', 'inverse', 'border', 'delete_label'
+    ];
+our $INTER_LABEL_GAP = 4; # pixels
+our $BLACK = [ 0, 0, 0 ];
+our $WHITE = [ 255, 255, 255 ];
+our $RED   = [ 0, 0, 255 ];
+
+# Methods for saving and loading config items
+our $CONFIG = {
+    default => {
+        save => sub { $_[0]->get_active() },
+        load => sub { $_[0]->set_active($_[1]) },
+    },
+    inverse => {
+        save => sub { $_[0]->get_active() ? 1 : 0 }
+    },
+    border => {
+        save => sub { $_[0]->get_active() ? 1 : 0 }
+    },
+    font => {
+        save => sub { $_[0]->get_font_name() },
+        load => sub { $_[0]->set_font_name($_[1]) },
+    }
+};
+
+our $ui;
+our @labels;
+our $current_label = undef;
+our $default_font; # A GtkFont object
+
+# See
+# http://etc.nkadesign.com/uploads/Printers/95CRRASE.pdf
+# for printer protocol
+# Test with https://9cb21392cee7550e9d82f3f871ce806316582628.googledrive.com/host/0B7Vet6dn3-Gwd3BKVmwzR0pjU0E/index.html
+sub prepare_image_for_printer {
+    my ($pb) = @_;
+
+    die "No pixbuf" unless ($pb);
+    my $pngdata = $pb->save_to_buffer("png");
+    my $gdimage = GD::Image->newFromPngData($pngdata);
+
+    # we turn it 90 degrees before anything else to orient to the printer
+    $gdimage = $gdimage->copyRotate90();
+
+    my @pixel = ();
+    my ($width, $height) = $gdimage->getBounds();
+
+    #my $b = $gdimage->colorAllocate(0, 0, 0);
+    #$gdimage->line(0, 0, $width, $height, $b);
+    #$gdimage->line(0, $height, $width, 0, $b);
+
+    my $output = ""
+        . "\e@"         # Initialise Clear print buffer
+        . "\eiS"        # Send printer status
+        . "\eiR".chr(1) # set raster transfer mode 1
+        ;
+
+    # Assume 64 pixel offset to centre rounded to nearest
+    # byte boundary, with an inexplicable 2 pixels extra
+    my $offset = 30 + (68 - $width) / 2;
+
+    print STDERR "Offset $offset Width $width\n";
+    for (my $y = $height - 1; $y >= 0 ; $y--) {
+        my $raster = '';
+
+        # Pack 8 pixels into an 8 bit byte
+        my $x;
+        my $byte = 0;
+        my $bit = 0;
+        for ($x = 0; $x < $offset; $x++) {
+            if (++$bit == 8) {
+                $raster .= chr($byte);
+                $bit = 0;
+            }
+        }
+        for ($x = 0; $x < $width; $x++) {
+            my $tmpcolor = $gdimage->getPixel($x, $y);
+            my ($r, $g, $b) = $gdimage->rgb($tmpcolor);
+            # it's B/W, so we only need to compare one value
+            # SMELL: use alpha?
+            $byte |= (0x80 >> $bit) if $r < 150;
+            if (++$bit == 8) {
+                $raster .= chr($byte);
+                $byte = 0;
+                $bit = 0;
+            }
+        }
+        $raster .= chr($byte) if $bit;
+        if ($raster =~ /[^\x00]/) {
+            $output .= "G"
+                . chr(length($raster) % 256)
+                . chr(int(length($raster) / 256))
+                . $raster;
+            print STDERR "Raster ".length($raster)."\n";
+        } else {
+            $output .= 'Z';
+            print STDERR "Zeros";
+        }
+    }
+    #$output .= "Z"; # advance tape
+#    $output .= "\x1A"; # SUB eject print buffer data
+    $output .= "\x0C"; # print buffer data
+    print length($output)." bytes\n";
+    return $output;
+}
+
+# -- GUI elements -----------------------------------------------------------
+sub kill_editorwindow {
+    Gtk2->main_quit();
+    save_config();
+}
+
+sub fill_printer_list {
+    my $found = 0;
+    foreach my $p (Net::CUPS->getDestinations()) {
+        $ui->get_widget('printer')->remove_text(0) unless $found;
+        $found = 1;
+        $ui->get_widget('printer')->append_text($p->getName());
+    }
+}
+
+# Print out the result with more or less ghetto way of passing data
+# from pixbuf to GD.
+sub print_clicked_cb {
+    my $pb = render_labels(0);
+
+    my ($fh, $fn);
+
+    if (!$device) {
+        open($fh, ">", $fn = "/tmp/cpanel");
+        binmode($fh);
+    } else {
+        sysopen($fh, $device, Fcntl::O_RDWR) || die $!;
+        print STDERR "Printing to $device\n";
+    }
+
+    print $fh prepare_image_for_printer($pb);
+
+    if ($device) {
+        local $/ = undef;
+        my $reply = ' ' x 256;
+        my $rb = sysread($fh, $reply, 256);
+        print "Response $rb "
+            . join(' ', map {
+                $_ =~ /[ -~]/ ? $_ : sprintf("%02x", ord($_))
+                   } split(//, $reply))
+            . "\n"; 
+        close($fh);
+    } else {
+        close($fh);
+        my $pn = $ui->get_widget('printer')->get_active_text();
+        foreach my $printer (Net::CUPS->getDestinations()) {
+            if ($pn eq $printer->getName()) {
+                $printer->printFile($fn, 'label');
+                return;
+            }
+        }
+    }
+}
+
+sub label_at {
+    my $x = shift;
+
+    my $last_label = $labels[0];
+    my $n = 1;
+    foreach my $label (@labels) {
+        return $last_label if $label->{offset} > $x;
+        $n++;
+        $last_label = $label;
+    }
+    return ($labels[scalar(@labels) - 1], scalar(@labels));
+}
+
+{
+    package Label;
+
+    sub new {
+        my $this = bless({
+            text => "",
+            inverse => 0,
+            border => 0,
+            xalign => 0
+                         }, shift);
+        return $this;
+    }
+
+    sub from_ui {
+        my $this = shift;
+
+        # Get the text from the text widget
+        my $buffer = $ui->get_widget('text')->get_buffer();
+        my ($start, $end) = $buffer->get_bounds();
+        $this->{text} = $buffer->get_text($start, $end, 1);
+        $this->{inverse} = $ui->get_widget('inverse')->get_active();
+        $this->{border} = $ui->get_widget('border')->get_active();
+        $this->{xalign} = $ui->get_widget('xalign')->get_active();
+    }
+
+    sub to_ui {
+        my $this = shift;
+        my $buffer = $ui->get_widget('text')->get_buffer();
+        #print STDERR "Set '$this->{text}' ".($current_label||'none')."\n";
+        $buffer->set_text($this->{text});
+        $ui->get_widget('inverse')->set_active($this->{inverse});
+        $ui->get_widget('border')->set_active($this->{border});
+        $ui->get_widget('xalign')->set_active($this->{xalign});
+    }
+
+    sub render {
+        my ($this, $tape_width, $highlight) = @_;
+
+        my $maxwidth = 32767;
+        # 32 bits per pixel is complete overkill! We only really need 1,
+        # but a1 doesn't work.
+        my $surface = Cairo::ImageSurface->create(
+            'argb32', $maxwidth, $tape_width);
+        my $cr      = Cairo::Context->create($surface);
+
+        my @layouts;
+        my $h = 0;
+        my $width = 0;
+        foreach my $line (split(/\n/, $this->{text})) {
+            # Set the default font
+            my $layout = Pango::Cairo::create_layout($cr);
+            $layout->set_font_description($default_font);
+            # Interpret the markup for this line - note we'll get an error
+            # if a span is broken across lines.
+            $layout->set_markup($line);
+            my ($xsize, $ysize) = $layout->get_pixel_size();
+            $h += $ysize;
+            $width = $xsize if $xsize > $width;
+            push(@layouts, {
+                x => $xsize,
+                y => $ysize,
+                layout => $layout
+                 });
+        }
+        
+        unless ($width) {
+            #print STDERR "Zero width label\n";
+            $width = $INTER_LABEL_GAP;
+        }
+
+        my $black = $highlight ? $RED : $BLACK;
+
+        $cr->set_source_rgb(@{$this->{inverse} ? $black : $WHITE});
+        $cr->rectangle(0, 0, $width, $tape_width);
+        $cr->fill();
+        $cr->set_source_rgb(@{$this->{inverse} ? $WHITE : $black});
+        my $xbase = 0;
+        if ($this->{border}) {
+            $xbase += 2;
+            $width += 4;
+            $cr->rectangle(1, 1, $width - 2, $tape_width - 2);
+            $cr->stroke();
+        }
+
+        my $space = ($tape_width - $h) / (scalar(@layouts) + 1);
+
+        # Alignment within the available space
+        my $yoff = $space;
+        foreach my $layout (@layouts) {
+            my $xoff = $xbase;
+            if ($this->{xalign} == 1) {
+                $xoff = ($width - $layout->{x}) / 2;
+            } elsif ($this->{xalign} == 2) {
+                $xoff = $width - $layout->{x};
+            }
+            $cr->move_to($xoff, $yoff);
+            Pango::Cairo::show_layout($cr, $layout->{layout});
+            $yoff += $layout->{y} + $space;
+        }
+        $cr->show_page();
+
+        # Contrary to the Cairo doc, 'rgb24' format has an alpha channel
+        $this->{pixbuf} = Gtk2::Gdk::Pixbuf->new_from_data(
+                $surface->get_data(), 'rgb', 1, 8,
+                $width, $tape_width, $surface->get_stride());
+    }
+}
+
+sub render_labels {
+    my $highlight_selected = shift;
+
+    # P-touch 1230PC 12mm tape is 64 pixels wide. Narrower tapes use
+    # only the centre print heads.
+    my $tape_width = $ui->get_widget('tape')->get_active_text() || '12mm';
+    $tape_width =~ s/mm$//;
+    $tape_width  = $tape_width * (64/12);
+
+    if (scalar(@labels)) {
+        my $superwidth = 0;
+
+        foreach my $label (@labels) {
+            $label->render(
+                $tape_width,
+                $highlight_selected
+                && $current_label
+                && $label == $current_label);
+            $superwidth += $label->{pixbuf}->get_width();
+        }
+        $superwidth += $INTER_LABEL_GAP * scalar(@labels) - 1;
+
+        # Create a super-pixbuf with all the labels
+        my $pixbuf = Gtk2::Gdk::Pixbuf->new(
+            'rgb', 1, 8, $superwidth, $tape_width);
+        # Fill background with a colour that will print as white so
+        # we can see inter-label cut lines
+        $pixbuf->fill(0xCAFEBABE);
+
+        my $xoff = 0;
+        foreach my $label (@labels) {
+            my $lpb = $label->{pixbuf};
+            $lpb->copy_area(0, 0, $lpb->get_width(), $lpb->get_height(),
+                            $pixbuf, $xoff, 0);
+            $label->{offset} = $xoff;
+            $xoff += $lpb->get_width() + $INTER_LABEL_GAP;
+        }
+        return $pixbuf;
+    } else {
+        return undef;
+    }
+}
+
+sub attribute_clicked {
+    my $attr = shift;
+    my $buffer = $ui->get_widget('text')->get_buffer();
+    return 0 unless $buffer->get_has_selection();
+    my ($start, $end) = $buffer->get_selection_bounds();
+    my $text = $buffer->get_text($start, $end, 1);
+    $buffer->delete($start, $end);
+    my $parms = join(" ", @_);
+    $parms = " $parms" if $parms;
+    $buffer->insert($start, "<$attr$parms>$text</$attr>");
+    $current_label->from_ui() if $current_label;
+    update_previews();
+}
+
+sub underline_clicked_cb   { attribute_clicked('u');   }
+sub tt_clicked_cb          { attribute_clicked('tt'); }
+sub italic_clicked_cb      { attribute_clicked('i');   }
+sub bold_clicked_cb        { attribute_clicked('b');   }
+sub sub_clicked_cb         { attribute_clicked('sub'); }
+sub sup_clicked_cb         { attribute_clicked('sup'); }
+
+sub tape_changed_cb { update_previews(); }
+
+sub font_set_cb {
+    my $font = $ui->get_widget('font')->get_font_name();
+    unless (attribute_clicked("span", "font=\"$font\"")) {
+        $default_font = Pango::FontDescription->from_string(
+            $ui->get_widget('font')->get_font_name());
+    }
+    update_previews();
+}
+
+sub ui_changed {
+    $current_label->from_ui() if $current_label && ref($current_label) ne 'HASH';
+    update_previews();
+}
+
+sub set_current_label {
+    my ($label, $index) = @_;
+
+    if ($label) {
+        foreach my $k (@$PER_LABEL) {
+            $ui->get_widget($k)->set_sensitive(1);
+        }
+        #print STDERR "Set label ".Data::Dumper->Dump([$label])."\n";
+        $current_label = undef;
+        $label->to_ui();
+        $current_label = $label;
+        $ui->get_widget('label_index')->set_text($index);
+        $ui->get_widget('text')->grab_focus();
+    } else {
+        foreach my $k (@$PER_LABEL) {
+            $ui->get_widget($k)->set_sensitive(0);
+        }
+        $ui->get_widget('label_index')->set_text('');
+        $current_label = undef;
+    }
+    update_previews();
+}
+
+sub add_label_clicked_cb {
+    my $label = new Label();
+    push(@labels, $label);
+    set_current_label($label, scalar(@labels));
+}
+
+sub delete_label_clicked_cb {
+    return unless $current_label;
+    my $last = $labels[1];
+    for (my $i = 0; $i < scalar(@labels); $i++) {
+        if ($labels[$i] == $current_label) {
+            splice(@labels, $i, 1);
+            set_current_label($last);
+            return;
+        }
+        $last = $labels[$i];
+    }
+}
+
+sub mouse_down_cb {
+    my ($scroll, $event) = @_;
+    # the x,y are relative to the viewport
+    my $x = $event->x() + $scroll->get_hadjustment()->get_value();
+    my $im = $ui->get_widget("all_image");
+    my $ipb = $im->get_pixbuf();
+    my $all = $im->get_allocation();
+    if ($ipb->get_width() < $all->width()) {
+        $x -= ($all->width() - $ipb->get_width()) / 2;
+    }
+    #print STDERR "Mouse at $x\n";
+    set_current_label(label_at($x));
+}
+
+sub text_insert_at_cursor { update_previews(); }
+
+# Reacts to most GUI changes, updates the preview to match the changes.
+sub update_previews {
+    # Enable the print button if we have some labels
+    $ui->get_widget('print')->set_sensitive(scalar(@labels));
+    my $pb = render_labels(1);
+    if ($pb) {
+        $ui->get_widget('print')->set_sensitive(1);
+        $ui->get_widget('all_image')->set_from_pixbuf($pb);
+    } else {
+        $ui->get_widget('print')->set_sensitive(1);
+    }
+    if ($current_label) {
+        $ui->get_widget('current_image')->set_from_pixbuf(
+            $current_label->{pixbuf});
+    }
+#    my $hadj = $ui->get_widget('previewscroll')->get_hadjustment();
+#    $hadj->set_value($hadj->upper());
+#    $ui->get_widget('previewscroll')->set_hadjustment($hadj);
+}
+
+sub encode {
+    $_[0] = '' unless defined $_[0];
+    $_[0] =~ s/([^ -}])/'~'.sprintf("%02d", ord($1))/ge;
+    return $_[0];
+}
+
+sub decode {
+    $_[0] = '' unless defined $_[0];
+    $_[0] =~ s/~(\d\d)/chr($1)/ge;
+    return $_[0];
+}
+
+sub save_config {
+    my $f;
+    print STDERR "Saving to " .SETTINGS."\n";
+
+    open($f, ">", SETTINGS) || die $!;
+    foreach my $opt (@$BASE) {
+        my $spec = $CONFIG->{$opt};
+        next if $opt eq 'default';
+        my $save = ($spec && $spec->{save}) || $CONFIG->{default}->{save};
+        print $f "$opt=" . encode(&$save($ui->get_widget($opt))) . "\n";
+    }
+    for (my $i = 0; $i < scalar(@labels); $i++) {
+        my $label = $labels[$i];
+        foreach my $k ( @$PER_LABEL ) {
+            if (defined $label->{$k}) {
+                print $f "label$i$k=".encode($label->{$k})."\n";
+            }
+        }
+    }
+    close($f);
+}
+
+sub load_config {
+    $ui->get_widget('xalign')->set_active(0);
+    $ui->get_widget('tape')->set_active(0);
+    $ui->get_widget('printer')->set_active(0);
+    return unless -e SETTINGS;
+    open(my $f, "<", SETTINGS) || die $!;
+    local $/ = "\n";
+    foreach my $setting (<$f>) {
+        chomp($setting);
+        next unless $setting;
+        my ($k, $v) = split("=", $setting, 2);
+        $v = decode($v);
+        if ($k =~ /label(\d+)(.*?)$/) {
+            my ($n, $k) = ($1, $2);
+            $labels[$n] = new Label() unless $labels[$n];
+            $labels[$n]{$k} = $v;
+        } else {
+            my $spec = $CONFIG->{$k};
+            my $load = ($spec && $spec->{load}) || $CONFIG->{default}->{load};
+            #print STDERR "Load $k=$v\n";
+            &$load($ui->get_widget($k), $v);
+        }
+    }
+    close($f);
+    $default_font = Pango::FontDescription->from_string(
+        $ui->get_widget('font')->get_font_name());
+}
+
+sub init_ui {
+    $ui = Gtk2::GladeXML->new(GLADE_FILE);
+    $ui->signal_autoconnect_from_package('');
+
+    fill_printer_list();
+
+    load_config();
+
+    set_current_label();
+
+    $ui->get_widget('text')->get_buffer()->signal_connect('changed', \&ui_changed);
+
+    update_previews();
+}
+
+sub main {
+    ($device) = @ARGV;
+
+    init_ui();
+    Gtk2->main();
+}
+
+main();
