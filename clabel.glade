@@ -7,7 +7,7 @@
     <property name="can_focus">False</property>
     <property name="title" translatable="yes">C-label</property>
     <property name="icon">clabel.png</property>
-    <signal name="delete_event" handler="kill_editorwindow" swapped="no"/>
+    <signal name="delete_event" handler="kill_editorwindow"/>
     <child>
       <widget class="GtkVBox" id="vbox1">
         <property name="visible">True</property>
@@ -16,7 +16,7 @@
           <widget class="GtkLabel" id="label1">
             <property name="visible">True</property>
             <property name="can_focus">False</property>
-            <property name="label" translatable="yes">&lt;b&gt;Current tape&lt;/b&gt;</property>
+            <property name="label" translatable="yes">&lt;b&gt;Printer Setup&lt;/b&gt;</property>
             <property name="use_markup">True</property>
           </widget>
           <packing>
@@ -80,7 +80,7 @@
 9mm
 6mm
 3.5mm</property>
-                <signal name="changed" handler="tape_changed_cb" swapped="no"/>
+                <signal name="changed" handler="tape_changed_cb"/>
               </widget>
               <packing>
                 <property name="expand">True</property>
@@ -101,7 +101,7 @@
             <property name="can_focus">True</property>
             <property name="hscrollbar_policy">automatic</property>
             <property name="vscrollbar_policy">automatic</property>
-            <signal name="button_press_event" handler="mouse_down_cb" swapped="no"/>
+            <signal name="button_press_event" handler="mouse_down_cb"/>
             <child>
               <widget class="GtkViewport" id="all_viewport">
                 <property name="visible">True</property>
@@ -138,7 +138,7 @@
                 <property name="tooltip" translatable="yes">Print</property>
                 <property name="use_action_appearance">False</property>
                 <property name="use_stock">True</property>
-                <signal name="clicked" handler="print_clicked_cb" swapped="no"/>
+                <signal name="clicked" handler="print_clicked_cb"/>
               </widget>
               <packing>
                 <property name="expand">True</property>
@@ -268,7 +268,7 @@
                 <property name="can_focus">True</property>
                 <property name="receives_default">True</property>
                 <property name="use_action_appearance">False</property>
-                <signal name="clicked" handler="bold_clicked_cb" swapped="no"/>
+                <signal name="clicked" handler="bold_clicked_cb"/>
                 <child>
                   <widget class="GtkImage" id="image1">
                     <property name="visible">True</property>
@@ -289,7 +289,7 @@
                 <property name="can_focus">True</property>
                 <property name="receives_default">True</property>
                 <property name="use_action_appearance">False</property>
-                <signal name="clicked" handler="italic_clicked_cb" swapped="no"/>
+                <signal name="clicked" handler="italic_clicked_cb"/>
                 <child>
                   <widget class="GtkImage" id="italic_img">
                     <property name="visible">True</property>
@@ -311,7 +311,7 @@
                 <property name="receives_default">True</property>
                 <property name="use_action_appearance">False</property>
                 <property name="focus_on_click">False</property>
-                <signal name="clicked" handler="underline_clicked_cb" swapped="no"/>
+                <signal name="clicked" handler="underline_clicked_cb"/>
                 <child>
                   <widget class="GtkImage" id="underline_img">
                     <property name="visible">True</property>
@@ -332,7 +332,7 @@
                 <property name="can_focus">True</property>
                 <property name="receives_default">True</property>
                 <property name="use_action_appearance">False</property>
-                <signal name="font_set" handler="font_set_cb" swapped="no"/>
+                <signal name="font_set" handler="font_set_cb"/>
               </widget>
               <packing>
                 <property name="expand">True</property>
@@ -347,7 +347,7 @@
                 <property name="can_focus">True</property>
                 <property name="receives_default">True</property>
                 <property name="use_action_appearance">False</property>
-                <signal name="clicked" handler="tt_clicked_cb" swapped="no"/>
+                <signal name="clicked" handler="tt_clicked_cb"/>
               </widget>
               <packing>
                 <property name="expand">False</property>
@@ -361,7 +361,7 @@
                 <property name="can_focus">True</property>
                 <property name="receives_default">True</property>
                 <property name="use_action_appearance">False</property>
-                <signal name="clicked" handler="sub_clicked_cb" swapped="no"/>
+                <signal name="clicked" handler="sub_clicked_cb"/>
                 <child>
                   <widget class="GtkImage" id="sub_img">
                     <property name="visible">True</property>
@@ -382,7 +382,7 @@
                 <property name="can_focus">True</property>
                 <property name="receives_default">True</property>
                 <property name="use_action_appearance">False</property>
-                <signal name="clicked" handler="sup_clicked_cb" swapped="no"/>
+                <signal name="clicked" handler="sup_clicked_cb"/>
                 <child>
                   <widget class="GtkImage" id="sup_img">
                     <property name="visible">True</property>
@@ -412,7 +412,7 @@
               <widget class="GtkLabel" id="alignment label">
                 <property name="visible">True</property>
                 <property name="can_focus">False</property>
-                <property name="label" translatable="yes">Alignment</property>
+                <property name="label" translatable="yes">HAlign</property>
               </widget>
               <packing>
                 <property name="expand">True</property>
@@ -425,13 +425,13 @@
                 <property name="visible">True</property>
                 <property name="can_focus">True</property>
                 <property name="has_tooltip">True</property>
-                <property name="tooltip" translatable="yes">Vertical alignment</property>
-                <property name="active">0</property>
+                <property name="tooltip" translatable="yes">VAlign</property>
+                <property name="active">1</property>
                 <property name="items">Left
 Centre
 Right
 </property>
-                <signal name="changed" handler="ui_changed" swapped="no"/>
+                <signal name="changed" handler="ui_changed"/>
               </widget>
               <packing>
                 <property name="expand">True</property>
@@ -446,7 +446,7 @@ Right
                 <property name="can_focus">True</property>
                 <property name="receives_default">True</property>
                 <property name="use_action_appearance">False</property>
-                <signal name="toggled" handler="ui_changed" swapped="no"/>
+                <signal name="toggled" handler="ui_changed"/>
               </widget>
               <packing>
                 <property name="expand">True</property>
@@ -462,7 +462,7 @@ Right
                 <property name="receives_default">True</property>
                 <property name="use_action_appearance">False</property>
                 <property name="yalign">0.46000000834465027</property>
-                <signal name="toggled" handler="ui_changed" swapped="no"/>
+                <signal name="toggled" handler="ui_changed"/>
               </widget>
               <packing>
                 <property name="expand">True</property>
@@ -488,7 +488,7 @@ Right
                 <property name="can_focus">True</property>
                 <property name="receives_default">True</property>
                 <property name="use_action_appearance">False</property>
-                <signal name="clicked" handler="add_label_clicked_cb" swapped="no"/>
+                <signal name="clicked" handler="add_label_clicked_cb"/>
               </widget>
               <packing>
                 <property name="expand">True</property>
@@ -503,7 +503,7 @@ Right
                 <property name="can_focus">True</property>
                 <property name="receives_default">True</property>
                 <property name="use_action_appearance">False</property>
-                <signal name="clicked" handler="delete_label_clicked_cb" swapped="no"/>
+                <signal name="clicked" handler="delete_label_clicked_cb"/>
               </widget>
               <packing>
                 <property name="expand">True</property>
