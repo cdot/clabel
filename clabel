@@ -194,7 +194,9 @@ sub label_at {
 
     my $n = 0;
     foreach my $label (@labels) {
-        return $n - 1 if $label->{offset} > $x;
+        if ($label->{offset} > $x) {
+            return $n - 1;
+        }
         $n++;
     }
     return scalar(@labels) - 1;
@@ -208,7 +210,8 @@ sub label_at {
             text => "",
             inverse => 0,
             border => 0,
-            xalign => 0
+            xalign => 0,
+            offset => 0
                          }, shift);
         return $this;
     }
@@ -230,9 +233,10 @@ sub label_at {
         my $this = shift;
         my $buffer = $ui->get_widget('text')->get_buffer();
         # SMELL: only way I could get GTK to work
-        my $s = Encode::decode(
+        my $s = $this->{text};
+        $s = Encode::decode(
             'utf8', Encode::encode(
-                'utf8', $this->{text},Encode::FB_CROAK),
+                'utf8', $s,Encode::FB_CROAK),
             Encode::FB_CROAK);
         #print STDERR "UI set '$this->{text}'\n";
         $buffer->set_text($s);#this->{text});
@@ -266,7 +270,7 @@ sub label_at {
         # out in the minimum required space.
         my @lines;
         my $total_height = 0; # total height of the label.
-        my $max_width = 0;    # width of the widest line in the label.
+        my $max_width = 10;  # width of the widest line in the label.
         foreach my $line (split(/\n/, $this->{text})) {
             $layout = Pango::Cairo::create_layout($context);
             # Set the default font
@@ -356,6 +360,7 @@ sub render_labels {
     my $superheight = 0;
 
     foreach my $label (@labels) {
+        #print STDERR "Render $label->{text}\n";
         $label->render($tape_width);
         next unless $label->{surface};
         $superwidth += $label->{surface}->get_width();
@@ -469,7 +474,7 @@ sub ui_changed {
 sub current_label {
     if (scalar(@_)) {
         $current_label = shift;
-        #print STDERR "Set label $current_label\n";
+        print STDERR "Set label $current_label\n";
         if ($current_label >= 0 && $labels[$current_label]) {
             $labels[$current_label]->to_ui();
             foreach my $k (@$PER_LABEL) {
@@ -613,7 +618,8 @@ sub load_config {
                 $labels[$n] = new Label();
                 #print STDERR "Made label $n\n";
             }
-            $labels[$n]{$k} = $v;
+            $labels[$n]->{$k} = $v;
+            #print STDERR "Label[$n]->{$k}=".$labels[$n]->{$k}."\n";
         } elsif ($k eq 'current_label') {
             current_label($v);
         } else {
@@ -623,6 +629,7 @@ sub load_config {
         }
     }
     close($f);
+
     $default_fontdesc = Pango::FontDescription->from_string(
         $ui->get_widget('font')->get_font_name());
 }
@@ -634,8 +641,6 @@ sub init_ui {
     fill_printer_list();
 
     load_config();
-
-    current_label();
 
     $ui->get_widget('text')->get_buffer()->signal_connect('changed', \&ui_changed);
 
