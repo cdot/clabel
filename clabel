@@ -8,8 +8,9 @@
 use strict;
 use warnings;
 
+# Before attempting to upgrade to Gtk3, make sure Pango::Cairo perl bindings
+# are available and work. They weren't on 8/10/17
 use Gtk2 -init;
-use Gtk2::GladeXML ();
 use Cairo ();
 use GD ();
 use Getopt::Long ();
@@ -18,6 +19,7 @@ use File::Basename ();
 use Net::CUPS ();
 use File::Temp ();
 use Encode ();
+use Data::Dumper;
 
 use constant GLADE_FILE => File::Basename::dirname(__FILE__).'/clabel.glade';
 use constant SETTINGS => "$ENV{HOME}/.config/clabel";
@@ -26,13 +28,13 @@ use constant SETTINGS => "$ENV{HOME}/.config/clabel";
 our $BASE = [ 'printer', 'font', 'tape' ];
 our $PER_LABEL = [
     'text', 'bold', 'italic', 'underline', 'tt',
-    'sub', 'sup', 'xalign', 'inverse', 'border', 'delete_label'
+    'sub', 'sup', 'halign', 'hmargin', 'inverse', 'delete_label'
     ];
 our $BLACK = [ 0, 0, 0 ];
 our $WHITE = [ 255, 255, 255 ];
 our $RED   = [ 0, 0, 255 ];
 our $INTER_LABEL_GAP = 4; # pixels
-our $HIGH_BORDER = 4; # highlight border
+our $HIGHLIGHT_BORDER = 2; # highlight border
 
 # Methods for saving and loading config items
 our $CONFIG = {
@@ -43,8 +45,8 @@ our $CONFIG = {
     inverse => {
         save => sub { $_[0]->get_active() ? 1 : 0 }
     },
-    border => {
-        save => sub { $_[0]->get_active() ? 1 : 0 }
+    hmargin => {
+        save => sub { $_[0]->get_value() }
     },
     font => {
         save => sub { $_[0]->get_font_name() },
@@ -54,9 +56,25 @@ our $CONFIG = {
 
 our $device;
 our $ui;
+# List of Labels objects
 our @labels;
+# Index of current labe;
 our $current_label = -1;
 our $default_fontdesc; # a font descriptor
+
+sub report {   
+    print join(
+        '',
+        map {
+          ref($_)
+            ? ( $_->can('stringify')
+                ? $_->stringify()
+                : ( $_->can('to_string')
+                    ? $_->to_string()
+                    : Data::Dumper->Dump([$_])))
+            :  $_
+       } @_) . "\n";
+}
 
 # See
 # http://etc.nkadesign.com/uploads/Printers/95CRRASE.pdf
@@ -143,9 +161,9 @@ sub kill_editorwindow {
 sub fill_printer_list {
     my $found = 0;
     foreach my $p (Net::CUPS->getDestinations()) {
-        $ui->get_widget('printer')->remove_text(0) unless $found;
+        $ui->get_object('printer')->remove_text(0) unless $found;
         $found = 1;
-        $ui->get_widget('printer')->append_text($p->getName());
+        $ui->get_object('printer')->append_text($p->getName());
     }
 }
 
@@ -179,7 +197,7 @@ sub print_clicked_cb {
         close($fh);
     } else {
         close($fh);
-        my $pn = $ui->get_widget('printer')->get_active_text();
+        my $pn = $ui->get_object('printer')->get_active_text();
         foreach my $printer (Net::CUPS->getDestinations()) {
             if ($pn eq $printer->getName()) {
                 $printer->printFile($fn, 'label');
@@ -194,7 +212,7 @@ sub label_at {
 
     my $n = 0;
     foreach my $label (@labels) {
-        if ($label->{offset} > $x) {
+        if ($label->{image_offset} > $x) {
             return $n - 1;
         }
         $n++;
@@ -207,11 +225,16 @@ sub label_at {
 
     sub new {
         my $this = bless({
+            # Text of the label
             text => "",
+            # Boolean, true to invert the label
             inverse => 0,
-            border => 0,
-            xalign => 0,
-            offset => 0
+            # int, px horz margin between text and edge
+            hmargin => 2,
+            # Horizontal alignment of label - left = 0, centre = 1, right = 2
+            halign => 1,
+            # Offset of the label in the all-labels picture
+            image_offset => 0
                          }, shift);
         return $this;
     }
@@ -220,18 +243,18 @@ sub label_at {
         my $this = shift;
 
         # Get the text from the text widget
-        my $buffer = $ui->get_widget('text')->get_buffer();
+        my $buffer = $ui->get_object('text')->get_buffer();
         my ($start, $end) = $buffer->get_bounds();
         $this->{text} = $buffer->get_text($start, $end, 1);
         #print STDERR "UI get '$this->{text}'\n";
-        $this->{inverse} = $ui->get_widget('inverse')->get_active();
-        $this->{border} = $ui->get_widget('border')->get_active();
-        $this->{xalign} = $ui->get_widget('xalign')->get_active();
+        $this->{inverse} = $ui->get_object('inverse')->get_active();
+        $this->{halign} = $ui->get_object('halign')->get_active();
+        $this->{hmargin} = $ui->get_object('hmargin')->get_value();
     }
 
     sub to_ui {
         my $this = shift;
-        my $buffer = $ui->get_widget('text')->get_buffer();
+        my $buffer = $ui->get_object('text')->get_buffer();
         # SMELL: only way I could get GTK to work
         my $s = $this->{text};
         $s = Encode::decode(
@@ -240,9 +263,9 @@ sub label_at {
             Encode::FB_CROAK);
         #print STDERR "UI set '$this->{text}'\n";
         $buffer->set_text($s);#this->{text});
-        $ui->get_widget('inverse')->set_active($this->{inverse});
-        $ui->get_widget('border')->set_active($this->{border});
-        $ui->get_widget('xalign')->set_active($this->{xalign});
+        $ui->get_object('inverse')->set_active($this->{inverse});
+        $ui->get_object('halign')->set_active($this->{halign});
+        $ui->get_object('hmargin')->set_value($this->{hmargin});
     }
 
     # Lay out the label in an image. The image is laid out on a surface
@@ -255,14 +278,9 @@ sub label_at {
 
         # Create a 0-sized surface just for measuring text
         my $surface = Cairo::ImageSurface->create('argb32', 0, 0);
-        my $context      = Cairo::Context->create($surface);
-
-        # Compute side margin ~ width of a space
-        my $layout = Pango::Cairo::create_layout($context);
-        $layout->set_font_description($default_fontdesc);
-        $layout->set_markup(' ');
-        my ($em) = $layout->get_pixel_size();
-
+        my $context = Cairo::Context->create($surface);
+        my $layout;
+        
         # A label may be made up of multiple lines. Layout each line
         # separately. Note we'll get an error if a <span> is broken
         # across lines, but this is the easiest way to lay out lines
@@ -277,9 +295,9 @@ sub label_at {
             $layout->set_font_description($default_fontdesc);
             $layout->set_markup($line);
             my ($xsize, $ysize) = $layout->get_pixel_size();
-            #print STDERR "'$line' is $xsize X $ysize\n";
+            main::report "'", $line, "' is ", $xsize, ' X ', $ysize;
             $total_height += $ysize;
-            $xsize += 2 * $em;
+            $xsize += 2 * $this->{hmargin};
             $max_width = $xsize if $xsize > $max_width;
             push(@lines, {
                 width  => $xsize,
@@ -293,6 +311,10 @@ sub label_at {
             return;
         }
 
+        # Remember how wide the label (not the surface) is
+        $this->{pxwidth} = $max_width;
+        $this->{mmwidth} = $max_width * (12 / 64);
+        
         #print STDERR "Label requires $max_width X $total_height\n";
 
         # Space above, below and between lines, and on left/right
@@ -300,8 +322,8 @@ sub label_at {
 
         # Create the rendering surface.
         # 32 bits per pixel is complete overkill!
-        my $surfw = $max_width + 2 * $HIGH_BORDER;
-        my $surfh = $tape_width + 2 * $HIGH_BORDER;
+        my $surfw = $max_width + 2 * $HIGHLIGHT_BORDER;
+        my $surfh = $tape_width + 2 * $HIGHLIGHT_BORDER;
         $surface = Cairo::ImageSurface->create(
             'argb32', $surfw, $surfh);
 
@@ -314,20 +336,23 @@ sub label_at {
 
         # Paint the label background
         $context->set_source_rgb(@{$this->{inverse} ? $BLACK : $WHITE});
-        $context->rectangle($HIGH_BORDER, $HIGH_BORDER, $max_width, $tape_width);
+        $context->rectangle($HIGHLIGHT_BORDER, $HIGHLIGHT_BORDER, $max_width, $tape_width);
         $context->fill();
 
         # Paint the label
         $context->set_source_rgb(@{$this->{inverse} ? $WHITE : $BLACK});
 
         # Alignment within the available space
-        my $yoff = $HIGH_BORDER + $space;
+        my $yoff = $HIGHLIGHT_BORDER + $space;
         foreach my $line (@lines) {
-            my $xoff = $HIGH_BORDER + $em;
-            if ($this->{xalign} == 1) { # centre
+            my $xoff = $HIGHLIGHT_BORDER;
+            
+            if ($this->{halign} == 1) { # left
+                $xoff += $this->{hmargin};
+            } elsif ($this->{halign} == 1) { # centre
                 $xoff += ($max_width - $line->{width}) / 2;
-            } elsif ($this->{xalign} == 2) { # right
-                $xoff += $max_width - $line->{width};
+            } elsif ($this->{halign} == 2) { # right
+                $xoff += $max_width - $this->{hmargin} - $line->{width};
             }
             $context->move_to($xoff, $yoff);
             $layout = Pango::Cairo::create_layout($context);
@@ -352,7 +377,7 @@ sub render_labels {
 
     # P-touch 1230PC 12mm tape is 64 pixels wide. Narrower tapes use
     # only the centre print heads.
-    my $tape_width = $ui->get_widget('tape')->get_active_text() || '12mm';
+    my $tape_width = $ui->get_object('tape')->get_active_text() || '12mm';
     $tape_width =~ s/mm$//;
     $tape_width  = $tape_width * (64/12);
 
@@ -375,8 +400,8 @@ sub render_labels {
     # if there is no highlight, get rid of the extra space
     # allocated for the highlight border
     unless ($highlight_selected) {
-        $superheight -= 2 * $HIGH_BORDER;
-        $superwidth -= scalar(@labels) * 2 * $HIGH_BORDER;
+        $superheight -= 2 * $HIGHLIGHT_BORDER;
+        $superwidth -= scalar(@labels) * 2 * $HIGHLIGHT_BORDER;
     }
 
     # Create a super-pixbuf with all the labels.
@@ -405,7 +430,7 @@ sub render_labels {
 
         #print STDERR "Layout ".$lpb->get_width()." X ".$lpb->get_height()
         #    ." label $i at $xoff\n";
-        $label->{offset} = $xoff;
+        $label->{image_offset} = $xoff;
         if ($highlight) {
             # Slap out the whole area, highlight included
             $lpb->copy_area(0, 0, $lpb->get_width(), $lpb->get_height(),
@@ -414,19 +439,19 @@ sub render_labels {
         } elsif ($highlight_selected) {
             # Whack out just the middle, allowing for the highlight
             $lpb->copy_area(
-                $HIGH_BORDER, $HIGH_BORDER,
-                $lpb->get_width() - 2 * $HIGH_BORDER,
-                $lpb->get_height() - 2 * $HIGH_BORDER,
-                $pixbuf, $xoff + $HIGH_BORDER, $HIGH_BORDER);
+                $HIGHLIGHT_BORDER, $HIGHLIGHT_BORDER,
+                $lpb->get_width() - 2 * $HIGHLIGHT_BORDER,
+                $lpb->get_height() - 2 * $HIGHLIGHT_BORDER,
+                $pixbuf, $xoff + $HIGHLIGHT_BORDER, $HIGHLIGHT_BORDER);
             $xoff += $lpb->get_width();
         } else {
             # Stick out the middle, with no highlight
             $lpb->copy_area(
-                $HIGH_BORDER, $HIGH_BORDER,
-                $lpb->get_width() - 2 * $HIGH_BORDER,
-                $lpb->get_height() - 2 * $HIGH_BORDER,
+                $HIGHLIGHT_BORDER, $HIGHLIGHT_BORDER,
+                $lpb->get_width() - 2 * $HIGHLIGHT_BORDER,
+                $lpb->get_height() - 2 * $HIGHLIGHT_BORDER,
                 $pixbuf, $xoff, 0);
-            $xoff += $lpb->get_width() - 2 * $HIGH_BORDER;
+            $xoff += $lpb->get_width() - 2 * $HIGHLIGHT_BORDER;
         }
         $xoff += $INTER_LABEL_GAP;
     }
@@ -435,13 +460,14 @@ sub render_labels {
 
 sub attribute_clicked {
     my $attr = shift;
-    my $buffer = $ui->get_widget('text')->get_buffer();
+    my $buffer = $ui->get_object('text')->get_buffer();
     return 0 unless $buffer->get_has_selection();
     my ($start, $end) = $buffer->get_selection_bounds();
     my $text = $buffer->get_text($start, $end, 1);
     $buffer->delete($start, $end);
     my $parms = join(" ", @_);
     $parms = " $parms" if $parms;
+    report 'Set ', $attr, $parms;
     $buffer->insert($start, "<$attr$parms>$text</$attr>");
     current_label()->from_ui() if current_label();
     update_previews();
@@ -457,11 +483,12 @@ sub sup_clicked_cb         { attribute_clicked('sup'); }
 sub tape_changed_cb { update_previews(); }
 
 sub font_set_cb {
-    my $font = $ui->get_widget('font')->get_font_name();
+    my $font = $ui->get_object('font')->get_font_name();
     unless (attribute_clicked("span", "font=\"$font\"")) {
         # If there is no currently selected text, set the default
+        report 'Set default font ', $ui->get_object('font')->get_font_name();
         $default_fontdesc = Pango::FontDescription->from_string(
-            $ui->get_widget('font')->get_font_name());
+            $ui->get_object('font')->get_font_name());
     }
     update_previews();
 }
@@ -478,16 +505,16 @@ sub current_label {
         if ($current_label >= 0 && $labels[$current_label]) {
             $labels[$current_label]->to_ui();
             foreach my $k (@$PER_LABEL) {
-                $ui->get_widget($k)->set_sensitive(1);
+                $ui->get_object($k)->set_sensitive(1);
             }
-            $ui->get_widget('label_index')->set_text($current_label);
-            $ui->get_widget('text')->grab_focus();
+            $ui->get_object('label_index')->set_text($current_label);
+            $ui->get_object('text')->grab_focus();
         } else {
             foreach my $k (@$PER_LABEL) {
-                $ui->get_widget($k)->set_sensitive(0);
+                $ui->get_object($k)->set_sensitive(0);
             }
-            $ui->get_widget('label_index')->set_text('');
-            $ui->get_widget('text')->get_buffer()->set_text('');
+            $ui->get_object('label_index')->set_text('');
+            $ui->get_object('text')->get_buffer()->set_text('');
         }
         update_previews();
     }
@@ -505,7 +532,7 @@ sub add_label_clicked_cb {
 
 sub delete_label_clicked_cb {
     return unless current_label();
-    print STDERR "Delete label $current_label\n";
+    report 'Delete label ', $current_label;
     splice(@labels, $current_label, 1);
     if ($current_label == scalar(@labels)) {
         $current_label--;
@@ -515,14 +542,14 @@ sub delete_label_clicked_cb {
     } else {
         current_label(-1);
     }
-    print STDERR "New label $current_label\n";
+    report 'New label ', current_label;
 }
 
 sub mouse_down_cb {
     my ($scroll, $event) = @_;
     # the x,y are relative to the viewport
     my $x = $event->x() + $scroll->get_hadjustment()->get_value();
-    my $im = $ui->get_widget("all_image");
+    my $im = $ui->get_object("all_image");
     my $ipb = $im->get_pixbuf();
     my $all = $im->get_allocation();
     if ($ipb->get_width() < $all->width()) {
@@ -537,16 +564,17 @@ sub text_insert_at_cursor { update_previews(); }
 # Reacts to most GUI changes, updates the preview to match the changes.
 sub update_previews {
     # Enable the print button if we have some labels
-    $ui->get_widget('print')->set_sensitive(scalar(@labels));
+    $ui->get_object('print')->set_sensitive(scalar(@labels));
     my $pb = render_labels(1);
     if ($pb) {
-        $ui->get_widget('print')->set_sensitive(1);
-        $ui->get_widget('all_image')->set_from_pixbuf($pb);
+        $ui->get_object('print')->set_sensitive(1);
+        $ui->get_object('all_image')->set_from_pixbuf($pb);
     } else {
-        $ui->get_widget('print')->set_sensitive(1);
-        $ui->get_widget('all_image')->clear();
+        $ui->get_object('print')->set_sensitive(1);
+        $ui->get_object('all_image')->clear();
     }
     my $cl = current_label();
+    my $size = '';
     if ($cl && $cl->{surface}) {
         my $lpb = Gtk2::Gdk::Pixbuf->new_from_data(
             $cl->{surface}->get_data(),
@@ -555,10 +583,13 @@ sub update_previews {
             $cl->{surface}->get_height(),
             $cl->{surface}->get_stride());
         
-        $ui->get_widget('current_image')->set_from_pixbuf($lpb);
+        $ui->get_object('current_image')->set_from_pixbuf($lpb);
+        $size = $cl->{pxwidth} . 'px ' . $cl->{mmwidth} . "mm";
     } else {
-        $ui->get_widget('current_image')->clear();
+        $ui->get_object('current_image')->clear();
     }
+    $ui->get_object('label_size')->set_text($size);
+
 }
 
 sub encode {
@@ -577,14 +608,14 @@ sub decode {
 
 sub save_config {
     my $f;
-    print STDERR "Saving to " .SETTINGS."\n";
+    report 'Saving to ', SETTINGS;
 
     open($f, '>:encoding(utf8)', SETTINGS) || die $!;
     foreach my $opt (@$BASE) {
         my $spec = $CONFIG->{$opt};
         next if $opt eq 'default';
         my $save = ($spec && $spec->{save}) || $CONFIG->{default}->{save};
-        print $f "$opt=" . encode(&$save($ui->get_widget($opt))) . "\n";
+        print $f "$opt=" . encode(&$save($ui->get_object($opt))) . "\n";
     }
     for (my $i = 0; $i < scalar(@labels); $i++) {
         my $label = $labels[$i];
@@ -600,9 +631,9 @@ sub save_config {
 }
 
 sub load_config {
-    $ui->get_widget('xalign')->set_active(0);
-    $ui->get_widget('tape')->set_active(0);
-    $ui->get_widget('printer')->set_active(0);
+    $ui->get_object('halign')->set_active(0);
+    $ui->get_object('tape')->set_active(0);
+    $ui->get_object('printer')->set_active(0);
     return unless -e SETTINGS;
     open(my $f, '<:encoding(utf8)', SETTINGS) || die $!;
     local $/ = "\n";
@@ -625,25 +656,26 @@ sub load_config {
         } else {
             my $spec = $CONFIG->{$k};
             my $load = ($spec && $spec->{load}) || $CONFIG->{default}->{load};
-            &$load($ui->get_widget($k), $v);
+            &$load($ui->get_object($k), $v);
         }
     }
     close($f);
 
     $default_fontdesc = Pango::FontDescription->from_string(
-        $ui->get_widget('font')->get_font_name());
+        $ui->get_object('font')->get_font_name());
+    report $default_fontdesc, $default_fontdesc->get_size();
 }
 
 sub init_ui {
-    $ui = Gtk2::GladeXML->new(GLADE_FILE);
-    $ui->signal_autoconnect_from_package('');
+    $ui = Gtk2::Builder->new();
+    $ui->add_from_file(GLADE_FILE);
+    $ui->connect_signals();
 
     fill_printer_list();
 
     load_config();
 
-    $ui->get_widget('text')->get_buffer()->signal_connect('changed', \&ui_changed);
-
+    $ui->get_object('text')->get_buffer()->signal_connect('changed', \&ui_changed);
     update_previews();
 }
 
