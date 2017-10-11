@@ -26,8 +26,6 @@ use IO::Select;
 our $GLADE_FILE = File::Basename::dirname(__FILE__).'/clabel.glade';
 our $SETTINGS_FILE = "$ENV{HOME}/.config/clabel";
 
-# Printer configuration
-# See http://www.undocprint.org/formats/page_description_languages/brother_p-touch
 our @GLOBAL_CFG = ( 'font' );
 our @PER_LABEL_CFG = (
     'text', 'bold', 'italic', 'underline', 'tt',
@@ -91,18 +89,22 @@ sub report {
 }
 
 {
-    # See http://support.brother.com/g/b/productseries.aspx?c=gb&lang=en&pcatid=21
+    # See
+    # http://support.brother.com/g/b/productseries.aspx?c=gb&lang=en&pcatid=21
+    # http://www.undocprint.org/formats/page_description_languages/brother_p-touch
+    # https://github.com/cbdevnet/pt1230
+    # http://etc.nkadesign.com/uploads/Printers/95CRRASE.pdf
     package Printer;
 
     our %PROTOCOL = (
         INVALIDATE => chr(0),
         INITIALISE_CLEAR => chr(0x1B).'@',
-        SET_RASTER_TRANSFER_MODE => "\eiR\1",
+        SET_RASTER_TRANSFER_MODE => chr(0x1B).'iR'.chr(0x01),
         SEND_PRINTER_STATUS => chr(0x1B).'iS',
-        EJECT => chr(0x1A),
-        FORMFEED => chr(0x0C),
-        SEND_RLE_RASTER => 'G',
-        ADVANCE => 'Z'
+        PRINT_FEED => chr(0x1A),
+        PRINT_NOFEED => chr(0x0C), # Not supposed to feed the tape, but it does!
+        SEND_RASTER => 'G',
+        EMPTY_RASTER => 'Z'
         );
     our @STATUS_BYTES = (
         { name => 'Print head mark', always => "\x80" },
@@ -151,83 +153,94 @@ sub report {
         my ($class, $device) = @_;
 
         my $this = bless({ device => $device }, $class);
-
+        
         $this->open_printer();
-        
-        local $| = 1; # disable buffering
-        my $fh = $this->{fh};
-        print $fh $PROTOCOL{INITIALISE_CLEAR};
-        
-        my $report = $this->get_status_report();
-        $this->{tape_width} = $report->{'Media width'};
 
+        my $report = $this->get_status_report();
+        
+        #$this->report($report);
+
+        # Use the report to determine parameters
+        #
+        # media_width_mm - width of tape media in mm
+        # raster_px - number of pixels in a raster line
+        # raster_mm - width of a raster line in mm
+        # printable_width_px - number of pixels at the centre of each
+        # raster line that are printable, will be <= raster_px. Limited by the
+        # number of pins on the device, or the media width if narrower.
+
+        $this->{media_width_mm} = $report->{'Media width'};
         if ($report->{'Model code'} eq 'Y') {
-            # The print protocol assumes each raster line is 128 bits wide
-            # (18mm at 180dpi), and each raster is centred in the middle of
-            # the tape.
-            $this->{pixel_width_mm} = 0.140625; # 180dpi
-            $this->{max_width_px} = 128;
-            if ($this->{tape_width} < 9) {
-                $this->{printable_width_px} =
-                    $this->{tape_width} / $this->{pixel_width_mm};
-            } else {
-                # Only 64 pins on PT1230PC
-                $this->{printable_width_px} = 64;
-            }
+            $this->{raster_mm} = 18;
+            $this->{raster_px} = 128;
+            $this->{printable_width_px} = 64; # max no of pins available
         } else {
             die "Don't know enough about model code $report->{'Model code'}";
         }
+
+        # pixel_width_mm - width of a single pixel in mm
+        $this->{pixel_width_mm} = $this->{raster_mm} / $this->{raster_px};
+
+        $this->report('A raster is ', $this->{raster_px}, 'px (',
+                     $this->{raster_mm}, 'mm) wide, max printable width is ',
+                     $this->{printable_width_px}, 'px (',
+                     $this->{printable_width_px} * $this->{pixel_width_mm},
+                     'mm)');       
+
+        # Derive other parameters
+        # media_width_px - width of tape media in px
+        # printable_width_mm - width in mm of the printable area
+        
+        $this->{media_width_px} = $this->{media_width_mm} / $this->{pixel_width_mm};
+        $this->report('Media is ', $this->{media_width_px}, 'px (',
+                     $this->{media_width_mm}, 'mm) wide');
+        
+        if ($this->{media_width_px} < $this->{printable_width_px}) {
+            $this->{printable_width_px} =
+                $this->{media_width_mm} / $this->{pixel_width_mm};
+            $this->report('Reducing printable area to ',
+                         $this->{printable_width_px}, 'px for ',
+                         $this->{media_width_mm}, 'mm media');
+        }
         $this->{printable_width_mm} = 
             $this->{printable_width_px} * $this->{pixel_width_mm};
-        # Minimum offset required to align with the edge of the
-        # printable area
-        $this->{min_offset} =
-            ($this->{max_width_px} - $this->{printable_width_px}) / 2;
 
+        $this->report('Printable width is ', $this->{printable_width_px}, 'px (',
+                     $this->{printable_width_mm}, 'mm)');
+        
         return $this;
     }
 
-    sub DESTROY {
+    sub report {
         my $this = shift;
-        $this->close_printer();
-    }
-
-    sub reset {
-        my $this = shift;
-        local $| = 1; # disable buffering
-        my $fh = $this->{fh};
-        print $fh $PROTOCOL{INVALIDATE} x 100;
-        $this->close_printer();
-        $this->open_printer();
-    }
-
-    sub open_printer {
-        my $this = shift;
-        # This *should* give us blocking IO
-        sysopen($this->{fh}, $this->{device}, Fcntl::O_RDWR) || die $!;
-        binmode($this->{fh});
-    }
-
-    sub close_printer {
-        my $this = shift;
-        close($this->{fh});
+        main::report('Printer: ', @_);
     }
     
-    # Get a status report from the printer
-    sub get_status_report {
+    sub open_printer {
         my $this = shift;
-        local $| = 1; # disable buffering
+        my $fh;
+        # This *should* give us blocking IO
+        sysopen($fh, $this->{device}, Fcntl::O_RDWR) || die $!;
+        binmode($fh);
+        $fh->autoflush(1);
+        syswrite($fh, $PROTOCOL{INVALIDATE} x 100);
+        syswrite($fh, $PROTOCOL{INITIALISE_CLEAR});
+        $this->{fh} = $fh;
+    }
+
+    # Get a status report from the printer (use existing fh)
+    sub get_status_report {
+        my ($this) = @_;
         
-        my $fh = $this->{fh};
-        print $fh $PROTOCOL{SEND_PRINTER_STATUS};
+        syswrite($this->{fh}, $PROTOCOL{SEND_PRINTER_STATUS});
 
         my $reply = ' ' x 32;
         my $rb;
         
         my $retry = 20;
         while ($retry--) {
-            $rb = sysread($fh, $reply, 32);
-            main::report('Status ', $!, ' ', length($reply), ' ', scalar(@STATUS_BYTES));
+            $rb = sysread($this->{fh}, $reply, 32);
+            $this->report('Status ', $!, ' ', length($reply), ' ', scalar(@STATUS_BYTES));
             last if length($reply) == 32;
             select(undef, undef, undef, 0.25);
         }
@@ -238,7 +251,7 @@ sub report {
         foreach my $sb (@STATUS_BYTES) {
             my $r = shift(@response);
             if (defined $sb->{always}) {
-                main::report('Unexpected ', $sb->{name},' in status; got ',
+                $this->report('Unexpected ', $sb->{name},' in status; got ',
                        ord($r), " but expected ", ord($sb->{always}))
                     unless $r eq $sb->{always};
             } elsif (defined $sb->{bits}) {
@@ -271,12 +284,8 @@ sub report {
     # Eject the tape
     sub eject {
         my $this = shift;
-        local $| = 1; # disable buffering
-        my $fh = $this->{fh};
-        print $fh $PROTOCOL{EJECT};
-        $this->close_printer();
-        $this->open_printer();
-        main::report("Ejected");
+        syswrite($this->{fh}, $PROTOCOL{PRINT_FEED});
+        $this->report("Ejected");
     }
 
     # Format and print the image on a single tape
@@ -296,25 +305,25 @@ sub report {
         # Width/height of image in pixels
         my ($width, $height) = $gdimage->getBounds();
 
+        $this->report('Print ', $width, ' X ', $height, ' image');
+
         #my $b = $gdimage->colorAllocate(0, 0, 0);
         #$gdimage->line(0, 0, $width, $height, $b);
         #$gdimage->line(0, $height, $width, 0, $b);
 
-        local $| = 1; # disable buffering
-
-        $this->reset();
-        my $fh = $this->{fh};
-        my $data = $PROTOCOL{SET_RASTER_TRANSFER_MODE};
-
-        # If we are printing narrower tape, the offset is scaled proportionally
-        my $offset = $this->{min_offset} - $width / 2;
-        if ($offset < 0) {
-            # The print width is wider than the max width of the tape.
+        if ($width > $this->{printable_width_px}) {
             # Just do the best we can.
-            $offset = $this->{min_offset};
+            $this->report('Losing ', $width - $this->{printable_width_px},
+                   'px from the image');
+            $width = $this->{printable_width_px};
         }
+        my $offset = ($this->{raster_px} - $width) / 2;
+       
+        $this->report('Print width ', $width, 'px');
+        $this->report('Raster padding ', $offset, 'px');
         
-        #print STDERR "Offset $offset Width $width\n";
+        my $fh = $this->{fh};
+        syswrite($fh, $PROTOCOL{SET_RASTER_TRANSFER_MODE});
         for (my $y = $height - 1; $y >= 0 ; $y--) {
             my $raster = '';
 
@@ -342,16 +351,17 @@ sub report {
             }
             $raster .= chr($byte) if $bit;
             if ($raster =~ /[^\x00]/) {
-                $data .= $PROTOCOL{SEND_RLE_RASTER};
-                $data .= chr(length($raster) % 256);
-                $data .= chr(int(length($raster) / 256));
-                $data .= $raster;
+                syswrite($fh, $PROTOCOL{SEND_RASTER});
+                syswrite($fh, chr(length($raster) % 256));
+                syswrite($fh, chr(int(length($raster) / 256)));
+                syswrite($fh, $raster);
             } else {
-                $data .= $PROTOCOL{ADVANCE};
+                syswrite($fh, $PROTOCOL{EMPTY_RASTER});
             }
         }
-        print $fh $data;
-        main::report('Printed ', length($data), ' image bytes');
+        syswrite($fh, $PROTOCOL{PRINT_FEED});
+        my $report = $this->get_status_report();
+        $this->report($report);
     }
 }
 
@@ -374,6 +384,11 @@ sub report {
         return $this;
     }
 
+    sub report {
+        my $this = shift;
+        main::report('Label: ', @_);
+    }
+    
     sub from_ui {
         my $this = shift;
 
@@ -423,18 +438,18 @@ sub report {
         # in the middle of their available space. Each line is laid
         # out in the minimum required space.
         my @lines;
-        my $total_height = 0; # total height of the label.
-        my $max_width = 10;  # width of the widest line in the label.
+        my $inner_height = 0; # total height of the label.
+        my $inner_width = 10;  # width of the widest line in the label.
         foreach my $line (split(/\n/, $this->{text})) {
             $layout = Pango::Cairo::create_layout($context);
             # Set the default font
             $layout->set_font_description($default_fontdesc);
             $layout->set_markup($line);
             my ($xsize, $ysize) = $layout->get_pixel_size();
-            #main::report "'", $line, "' is ", $xsize, ' X ', $ysize;
-            $total_height += $ysize;
+            #$this->report "'", $line, "' is ", $xsize, ' X ', $ysize;
+            $inner_height += $ysize;
             $xsize += 2 * $this->{hmargin};
-            $max_width = $xsize if $xsize > $max_width;
+            $inner_width = $xsize if $xsize > $inner_width;
             push(@lines, {
                 width  => $xsize,
                 height => $ysize,
@@ -442,29 +457,30 @@ sub report {
                  });
         }
         
-        if ($max_width == 0) {
+        if ($inner_width == 0) {
             #print STDERR "Zero width label $this->{text}\n";
             return;
         }
 
         # Remember how wide the label (not the surface) is
-        $this->{pxwidth} = $max_width;
+        $this->{pxheight} = $inner_height;
+        $this->{pxwidth} = $inner_width;
         
         # Space above, below, and between lines
-        my $space = ($print_width - $total_height) / (scalar(@lines) + 1);
+        my $space = ($print_width - $inner_height) / (scalar(@lines) + 1);
         $space = 0 if $space < 0;
         
         # Create the rendering surface.
         # 32 bits per pixel is complete overkill!
-        my $surfw = $max_width + 2 * $border;
-        my $surfh = $total_height + 2 * $border;
+        my $surfw = $inner_width + 2 * $border;
+        my $surfh = $inner_height + 2 * $border;
         $surface = Cairo::ImageSurface->create(
             'argb32', $surfw, $surfh);
 
-        main::report('Label requires ', $total_height);
-        main::report('Printer offers ', $print_width);
-        main::report('Surface is ', $surfw, ' X ', $surfh);
-        main::report('Space is ', $space);
+        #$this->report('Label requires width ', $inner_height);
+        #$this->report('Printer offers ', $print_width);
+        #$this->report('Surface is ', $surfw, ' X ', $surfh);
+        #$this->report('Space is ', $space);
 
         $context = Cairo::Context->create($surface);
 
@@ -492,9 +508,9 @@ sub report {
             if ($this->{halign} == 0) {
                 $xoff += $this->{hmargin};
             } elsif ($this->{halign} == 1) {
-                $xoff += ($max_width - $line->{width}) / 2;
+                $xoff += ($inner_width - $line->{width}) / 2;
             } elsif ($this->{halign} == 2) {
-                $xoff += $max_width - $this->{hmargin} - $line->{width};
+                $xoff += $inner_width - $this->{hmargin} - $line->{width};
             }
             $context->move_to($xoff, $yoff);
             $layout = Pango::Cairo::create_layout($context);
@@ -505,15 +521,14 @@ sub report {
             $yoff += $line->{height} + $space;
         }
 
-        # Add marker lines to indicate tape width if required
-        if ($for_display && $total_height > $print_width) {
+        # Add areas to indicate tape width if required
+        if ($for_display && $inner_height > $print_width) {
             $context->set_source_rgba(@BLACK, 0.2);
-            my $inset = ($total_height - $print_width) / 2 + $border;
-            main::report("Green lines ", $inset);
+            my $inset = ($inner_height - $print_width) / 2;
             $context->rectangle($border, $border,
                                 $surfw - $border, $inset);
             $context->fill();
-            $context->rectangle($border, $surfh - $inset,
+            $context->rectangle($border, $surfh - $border - $inset,
                                 $surfw - $border, $inset);
             $context->fill();
         }
@@ -530,8 +545,7 @@ sub kill_editorwindow {
     save_config();
 }
 
-# Print out the result with more or less ghetto way of passing data
-# from pixbuf to GD.
+# Print out the result
 sub print_clicked_cb {
     my $pb = render_labels(0, $printer->{printable_width_px});
     $printer->print_image($pb);
@@ -749,7 +763,8 @@ sub update_previews {
         
         $ui->get_object('current_image')->set_from_pixbuf($lpb);
         my $mmwidth = $cl->{pxwidth} * $printer->{pixel_width_mm};
-        $size = "$cl->{pxwidth}px (${mmwidth}mm)";
+        my $mmheight = $cl->{pxheight} * $printer->{pixel_width_mm};
+        $size = "$cl->{pxwidth}px (${mmwidth}mm) X $cl->{pxheight}px (${mmheight}mm)";
     } else {
         $ui->get_object('current_image')->clear();
     }
@@ -821,7 +836,7 @@ sub load_config {
             my $load = ($spec && $spec->{load}) || $CONFIG->{default}->{load};
             my $obj = $ui->get_object($k);
             next unless $obj;
-            report "Load $k";
+            #report "Load $k";
             &$load($obj, $v);
         }
     }

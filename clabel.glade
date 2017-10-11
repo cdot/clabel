@@ -244,7 +244,6 @@
                 <property name="receives_default">True</property>
                 <property name="has_tooltip">True</property>
                 <property name="tooltip_text" translatable="yes">Select the font for the selected text (or all text if none is selected)</property>
-                <property name="font">Sans 12</property>
                 <property name="use_font">True</property>
                 <property name="use_size">True</property>
                 <signal name="font-set" handler="font_set_cb" swapped="no"/>
