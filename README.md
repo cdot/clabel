@@ -1,4 +1,7 @@
 # clabel
+
+THIS WORKS, BUT IS UNSUPPORTED. DEVELOPMENT HAS MOVED TO cdot/clabel-js
+
 Derivative of B-label with improved UI and formatting
 
 Run with
