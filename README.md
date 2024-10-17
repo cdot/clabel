@@ -1,6 +1,6 @@
 # clabel
 
-THIS WORKS, BUT IS UNSUPPORTED. DEVELOPMENT HAS MOVED TO cdot/clabel-js
+THIS WORKS, BUT IS UNSUPPORTED. DEVELOPMENT HAS MOVED TO [cdot/clabel-js](https://github.com/cdot/clabel-js)
 
 Derivative of B-label with improved UI and formatting
 
